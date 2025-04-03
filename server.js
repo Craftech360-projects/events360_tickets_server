@@ -8,7 +8,6 @@ const app = express();
 const port = process.env.PORT || 3003;
 
 // Initialize Supabase client
-
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY,
@@ -16,11 +15,6 @@ const supabase = createClient(
     db: { schema: "admin" },
   }
 );
-
-// Use admin schema for widget_keys and tickets
-const adminDb = getSupabaseClient("admin");
-// Use public schema for transactions and users
-const publicDb = getSupabaseClient("public");
 
 app.use(
   cors({
@@ -88,6 +82,152 @@ app.get("/tickets/:eventId", async (req, res) => {
   }
 });
 
+// Add webhook handler for Razorpay events
+app.post("/webhook/razorpay", async (req, res) => {
+  try {
+    const signature = req.headers["x-razorpay-signature"];
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+
+    // Verify webhook signature
+    const crypto = require("crypto");
+    const expectedSignature = crypto
+      .createHmac("sha256", secret)
+      .update(JSON.stringify(req.body))
+      .digest("hex");
+
+    if (signature !== expectedSignature) {
+      throw new Error("Invalid webhook signature");
+    }
+
+    const event = req.body;
+    const orderId = event.payload.payment.entity.order_id;
+
+    // Find the transaction
+    const { data: transaction, error: txError } = await supabase
+      .schema("public")
+      .from("ticket_transactions")
+      .select("*")
+      .eq("razorpay_order_id", orderId)
+      .single();
+
+    if (txError) throw txError;
+
+    // Log the webhook event
+    await supabase
+      .schema("public")
+      .from("payment_logs")
+      .update({
+        webhook_events: supabase.raw("array_append(webhook_events, ?)", [
+          event,
+        ]),
+        updated_at: new Date(),
+      })
+      .eq("transaction_id", transaction.id);
+
+    // Handle different event types
+    switch (event.event) {
+      case "payment.captured":
+        await handlePaymentSuccess(transaction.id, event);
+        break;
+      case "payment.failed":
+        await handlePaymentFailure(transaction.id, event);
+        break;
+      case "refund.processed":
+        await handleRefundSuccess(transaction.id, event);
+        break;
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    console.error("Webhook error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+async function handlePaymentSuccess(transactionId, event) {
+  const payment = event.payload.payment.entity;
+
+  // Check if payment was already processed
+  const { data: existingBooking } = await supabase
+    .schema("public")
+    .from("bookings")
+    .select()
+    .eq("payment_reference", payment.id)
+    .single();
+
+  if (existingBooking) {
+    console.log("Payment already processed:", payment.id);
+    return;
+  }
+
+  // Process the payment
+  const { error } = await supabase.rpc("process_ticket_purchase", {
+    p_transaction_id: transactionId,
+    p_payment_id: payment.id,
+    p_signature: payment.signature,
+  });
+
+  if (error) {
+    // Log failure for manual investigation
+    await supabase
+      .schema("public")
+      .from("payment_logs")
+      .insert({
+        transaction_id: transactionId,
+        razorpay_order_id: payment.order_id,
+        razorpay_payment_id: payment.id,
+        amount: payment.amount / 100,
+        status: "failed",
+        last_error: error.message,
+      });
+  }
+}
+
+async function handlePaymentFailure(transactionId, event) {
+  const payment = event.payload.payment.entity;
+
+  await supabase
+    .schema("public")
+    .from("payment_logs")
+    .insert({
+      transaction_id: transactionId,
+      razorpay_order_id: payment.order_id,
+      razorpay_payment_id: payment.id,
+      amount: payment.amount / 100,
+      status: "failed",
+      last_error: payment.error_description,
+    });
+
+  // Update transaction status
+  await supabase
+    .schema("public")
+    .from("ticket_transactions")
+    .update({ status: "failed" })
+    .eq("id", transactionId);
+}
+
+async function handleRefundSuccess(transactionId, event) {
+  const refund = event.payload.refund.entity;
+
+  await supabase
+    .schema("public")
+    .from("payment_logs")
+    .insert({
+      transaction_id: transactionId,
+      razorpay_order_id: refund.order_id,
+      razorpay_payment_id: refund.payment_id,
+      amount: refund.amount / 100,
+      status: "refunded",
+    });
+
+  // Update transaction status
+  await supabase
+    .schema("public")
+    .from("ticket_transactions")
+    .update({ status: "refunded" })
+    .eq("id", transactionId);
+}
+
 app.post("/verify-payment", async (req, res) => {
   try {
     const {
@@ -137,10 +277,26 @@ app.post("/verify-payment", async (req, res) => {
 // Purchase ticket
 app.post("/purchase", async (req, res) => {
   try {
-    const { ticketId, quantity, organizationId, userId } = req.body;
+    const { ticketId, quantity, organizationId, userDetails } = req.body;
 
-    if (!ticketId || !quantity || !organizationId || !userId) {
-      return res.status(400).json({ error: "Missing required fields" });
+    // Validate required fields
+    const requiredFields = {
+      ticketId: "Ticket ID",
+      quantity: "Quantity",
+      organizationId: "Organization ID",
+      "userDetails.name": "Customer Name",
+      "userDetails.email": "Email",
+      "userDetails.phone": "Phone Number",
+    };
+
+    const missingFields = Object.entries(requiredFields)
+      .filter(([key]) => !key.split(".").reduce((obj, k) => obj?.[k], req.body))
+      .map(([, label]) => label);
+
+    if (missingFields.length > 0) {
+      return res.status(400).json({
+        error: `Missing required fields: ${missingFields.join(", ")}`,
+      });
     }
 
     const { data: ticketData, error: ticketError } = await supabase
@@ -164,6 +320,28 @@ app.post("/purchase", async (req, res) => {
 
     const price = parseFloat(ticketData.price) || 0.0;
     const amount = Math.floor(price * quantity * 100);
+
+    // Create transaction record with user details
+    const { data: transaction, error: txError } = await supabase
+      .from("ticket_transactions")
+      .insert({
+        ticket_id: ticketId,
+        quantity: quantity,
+        unit_price: ticketData.price,
+        total_amount: price * quantity,
+        status: "pending",
+        customer_name: userDetails.name,
+        customer_email: userDetails.email,
+        customer_phone: userDetails.phone,
+        ticket_type: ticketData.ticket_type,
+        event_name: ticketData.events.name,
+        purchase_date: new Date().toISOString(),
+        organization_id: organizationId,
+      })
+      .select()
+      .single();
+
+    if (txError) throw txError;
 
     // Create Razorpay order
     const authString = `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`;
@@ -195,23 +373,6 @@ app.post("/purchase", async (req, res) => {
 
     const orderData = await orderResponse.json();
 
-    // Create transaction record
-    const { data: transaction, error: txError } = await supabase
-      .from("ticket_transactions")
-      .insert({
-        ticket_id: ticketId,
-        user_id: userId, // This variable is undefined - needs to be passed from client
-        quantity: quantity,
-        unit_price: ticketData.price,
-        total_amount: price * quantity,
-        razorpay_order_id: orderData.id,
-        status: "pending",
-      })
-      .select()
-      .single();
-
-    if (txError) throw txError;
-
     res.json({
       paymentIntent: {
         key_id: process.env.RAZORPAY_KEY_ID,
@@ -220,7 +381,11 @@ app.post("/purchase", async (req, res) => {
         currency: "INR",
         name: ticketData.name,
         description: `${quantity}x ${ticketData.name}`,
-        prefill: { contact: "", email: "" },
+        prefill: {
+          name: userDetails.name,
+          email: userDetails.email,
+          contact: userDetails.phone,
+        },
       },
       transaction_id: transaction.id,
     });
