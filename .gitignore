@@ -1,0 +1,53 @@
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# Logs
+logs/
+*.log
+logs/*.log
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist/
+build/
+
+# Dependency directories
+.bower_components/
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+*.pdb
+*.db-journal
+
+# Debugging
+*.swp
+*.swo
+
+# IDE/editor-specific files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Miscellaneous
+coverage/
+.nyc_output/
+*.tgz
+*.zip
+
+# PM2 Process Manager
+pids/
+dump.pm2
+
+# Docker
+docker-compose.override.yml
